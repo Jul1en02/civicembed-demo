@@ -3,3 +3,7 @@ faiss-cpu
 numpy
 torch
 sentence-transformers
+langdetect>=1.0.9
+deep-translator>=1.10.1
+googletrans
+deep_translator
