@@ -24,10 +24,11 @@ st.set_page_config(
 )
 
 # ─── CONSTANTS ───────────────────────────────────────────────────────────────
-TEXT_MODEL    = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+TEXT_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 INDEX_PATH    = "base_embeddings.faiss"
 ID_LIST_PATH  = "base_id_list.json"
-META_PATH     = "dataset_info.json"
+#META_PATH     = "dataset_info.json"
+META_PATH     = "dataset_info_openai_translated.json"
 MAX_DESC_LEN  = 300    # chars before expander kicks in
 SEARCH_TOP_K  = 400    # retrieve up to N matches then filter
 
