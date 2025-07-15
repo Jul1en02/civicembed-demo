@@ -1,17 +1,13 @@
-# civicembed_streamlit.py — revamped UI with the same feature set but smoother UX
-# ============================================================================
-# Key improvements -----------------------------------------------------------
-# • Cleaner layout using a sidebar for filters and a main pane for results.
-# • Sliders & filter widgets automatically clamp to realistic ranges.
-# • Format filter bug fixed — the card now reflects true dataset formats.
-# • Empty metadata fields are skipped in the summary line to reduce clutter.
-# • A compact inline “Read more” expander that keeps the description flow.
-# • Result counter + early exit message when no datasets match.
-# ----------------------------------------------------------------------------
+# app.py — CivicEmbed Demo with Blendable Base & Topical Lenses
+# ===========================================================================
 
 import streamlit as st
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 import json
+import faiss
+import numpy as np
 from pathlib import Path
 from sentence_transformers import SentenceTransformer
 from utils.search import CivicSearcher
@@ -24,45 +20,38 @@ st.set_page_config(
 )
 
 # ─── CONSTANTS ───────────────────────────────────────────────────────────────
-TEXT_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
-INDEX_PATH    = "base_embeddings.faiss"
-ID_LIST_PATH  = "base_id_list.json"
-#META_PATH     = "dataset_info.json"
-META_PATH     = "dataset_info_openai_translated.json"
-MAX_DESC_LEN  = 300    # chars before expander kicks in
-SEARCH_TOP_K  = 400    # retrieve up to N matches then filter
+ROOT            = Path(__file__).resolve().parent
+DATA            = ROOT / "data"
 
-# ─── CATEGORY MAP (DE→EN) ────────────────────────────────────────────────────
-CATEGORY_MAP = {
-    "Landwirtschaft, Fischerei, Forstwirtschaft und Nahrungsmittel":
-        "Agriculture, fisheries, forestry and food",
-    "Regierung und öffentlicher Sektor":
-        "Government and public sector",
-    "Regionen und Städte":
-        "Regions and cities",
-    "Umwelt":
-        "Environment",
-    "Verkehr":
-        "Transport",
-    "Wirtschaft und Finanzen":
-        "Economy and finance",
-}
+TEXT_MODEL      = "sentence-transformers/all-MiniLM-L6-v2"
+BASE_INDEX      = DATA / "base_embeddings.faiss"
+TOPIC_INDEX     = DATA / "topic_embeddings.faiss"
+ID_LIST_PATH    = DATA / "base_id_list.json"
+TOPIC_ID_LIST   = DATA / "topic_id_list.json"
+META_PATH       = DATA / "opendataswiss_metadata_en_with_groups.json"
+MAX_DESC_LEN    = 300    # chars before expander
+SEARCH_TOP_K    = 400
 
-# ─── HELPERS ─────────────────────────────────────────────────────────────────
+# Path to the trained topical lens weights:
+TOPIC_LENS_WEIGHTS = DATA / "embeddings" / "topical_lens.pt"
+
+# ─── UTILITIES ───────────────────────────────────────────────────────────────
 def get_en_group(g):
-    """Return the English label for a group entry (dict | str)."""
-    if isinstance(g, dict):
-        return g.get("en") or next(iter(g.values()), "")
-    if isinstance(g, str):
-        try:
-            obj = json.loads(g)
-            if isinstance(obj, dict):
-                return obj.get("en") or next(iter(obj.values()), "")
-        except Exception:
-            pass
-        return CATEGORY_MAP.get(g, g)
     return str(g)
 
+# ─── TOPIC LENS MODEL ────────────────────────────────────────────────────────
+class LensMLP(nn.Module):
+    def __init__(self, dim=384, hidden=512):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(dim, hidden),
+            nn.ReLU(),
+            nn.Linear(hidden, dim, bias=False)
+        )
+    def forward(self, x):
+        return F.normalize(self.net(x), p=2, dim=-1)
+
+# ─── CACHING ─────────────────────────────────────────────────────────────────
 @st.cache_resource(show_spinner=False)
 def load_encoder():
     return SentenceTransformer(TEXT_MODEL, device="cpu")
@@ -70,136 +59,149 @@ def load_encoder():
 @st.cache_resource(show_spinner=False)
 def load_searcher():
     return CivicSearcher(
-        index_path=INDEX_PATH,
-        id_list_path=ID_LIST_PATH,
-        metadata_path=META_PATH,
+        index_path=str(BASE_INDEX),
+        id_list_path=str(ID_LIST_PATH),
+        metadata_path=str(META_PATH),
     )
+
+@st.cache_resource(show_spinner=False)
+def load_topic_index():
+    idx = faiss.read_index(str(TOPIC_INDEX))
+    ids = json.loads(Path(TOPIC_ID_LIST).read_text(encoding="utf-8"))
+    return idx, ids
 
 @st.cache_data(show_spinner=False)
 def load_metadata():
-    return json.loads(Path(META_PATH).read_text(encoding="utf-8"))
+    return json.loads(META_PATH.read_text(encoding="utf-8"))
 
 @st.cache_data(show_spinner=False)
 def embed_query(_model, txt: str):
-    """Embed a query string using the cached model without hashing errors."""
     with torch.no_grad():
-        return _model.encode([txt]).astype("float32")
+        vec = _model.encode([txt], convert_to_numpy=True)
+    return vec.astype("float32")
 
-# ─── INITIALISATION ──────────────────────────────────────────────────────────
-encoder  = load_encoder()
-searcher = load_searcher()
-metadata = load_metadata()
+# ─── INITIALIZATION ─────────────────────────────────────────────────────────
+encoder        = load_encoder()
+searcher       = load_searcher()
+topic_index, topic_ids = load_topic_index()
+metadata_list  = load_metadata()
 
-# Pre-compute global option lists
-publishers     = sorted({m.get("publisher", "–") for m in metadata})
-all_group_keys = {get_en_group(g) for m in metadata for g in m.get("groups", [])}
-categories     = sorted(all_group_keys)
-formats_list   = sorted({
-    fmt.lower()  # normalise case
-    for m in metadata
+# Build metadata lookup
+metadata_map = {rec["id"]: rec for rec in metadata_list}
+
+# Precompute filter options
+publishers   = sorted({m.get("publisher", "–") for m in metadata_list})
+categories   = sorted({get_en_group(g) for m in metadata_list for g in m.get("groups", [])})
+formats_list = sorted({
+    fmt.lower()
+    for m in metadata_list
     for fmt in (m.get("structured_formats") or m.get("resource_formats", []))
 })
-
-years = sorted({m.get("issued_year") for m in metadata if m.get("issued_year")})
+years        = sorted({m.get("issued_year") for m in metadata_list if m.get("issued_year")})
 min_year, max_year = (min(years), max(years)) if years else (0, 0)
 
-# ─── SIDEBAR — FILTERS ───────────────────────────────────────────────────────
-st.sidebar.header("🔧 Filters")
-
-# 1️⃣ Issued year range — clamp to [1900, max_year] for smoother control
-issued_year = st.sidebar.slider(
+# ─── SIDEBAR ─────────────────────────────────────────────────────────────────
+st.sidebar.header("🔧 Filters & Blending")
+issued_year    = st.sidebar.slider(
     "Issued year range",
     max(min_year, 1900), max_year,
     (max(min_year, 1900), max_year),
     step=1,
 )
-
-# 2️⃣ Other filters — empty by default (opt-in)
 sel_formats    = st.sidebar.multiselect("Formats", formats_list)
 sel_publishers = st.sidebar.multiselect("Publishers", publishers)
 sel_categories = st.sidebar.multiselect("Categories", categories)
 
-# ─── MAIN AREA ───────────────────────────────────────────────────────────────
+w_base  = st.sidebar.slider("Base weight",  0.0, 1.0, 0.5, 0.05)
+w_topic = st.sidebar.slider("Topic weight", 0.0, 1.0, 0.5, 0.05)
+norm    = (w_base + w_topic) or 1e-6
+
+# ─── MAIN ────────────────────────────────────────────────────────────────────
 st.title("CivicEmbed Demo")
 query = st.text_input("Search prompt", "Mobility in Lausanne")
 
 if query:
-    q_vec   = embed_query(encoder, query)
-    hits = searcher.search(q_vec, top_k=2000, normalize=True)
-    threshold = 0.50  # or expose this in sidebar
-    hits = [h for h in hits if h.get("score", 0.0) >= threshold]
+    # 1) Embed query
+    q_base = embed_query(encoder, query)
 
+    # 2) Base search
+    base_hits   = searcher.search(q_base, top_k=SEARCH_TOP_K, normalize=True)
+    base_scores = {h["id"]: h["score"] for h in base_hits}
+
+    # 3) Topic lens projection & search
+    lens_model = LensMLP(dim=384)
+    lens_model.load_state_dict(torch.load(TOPIC_LENS_WEIGHTS, map_location="cpu"))
+    lens_model.eval()
+    with torch.no_grad():
+        q_topic = lens_model(torch.from_numpy(q_base)).detach().numpy()
+    Dt, It = topic_index.search(q_topic, SEARCH_TOP_K)
+    topic_scores = { topic_ids[i]: dist for dist, i in zip(Dt[0], It[0]) }
+
+    # 4) Combine scores
+    combined = {}
+    for ds_id, sc in base_scores.items():
+        combined[ds_id] = w_base * sc
+    for ds_id, sc in topic_scores.items():
+        combined[ds_id] = combined.get(ds_id, 0.0) + w_topic * sc
+    for ds_id in combined:
+        combined[ds_id] /= norm
+
+    # 5) Build sorted hits
+    sorted_hits = sorted(combined.items(), key=lambda x: x[1], reverse=True)
+    hits = [
+        { **metadata_map[ds_id], "id": ds_id, "score": float(score) }
+        for ds_id, score in sorted_hits[:SEARCH_TOP_K]
+    ]
+
+    # 6) Apply filters
     results = []
-
-    # ——— apply filters ———
+    threshold = 0.05
     for h in hits:
+        if h["score"] < threshold: continue
         yr = h.get("issued_year")
-        if yr is None or not (issued_year[0] <= yr <= issued_year[1]):
-            continue
-
-        dataset_fmts = {
-            fmt.lower() for fmt in (
-                h.get("structured_formats") or h.get("resource_formats", [])
-            )
-        }
-        if sel_formats and not dataset_fmts.intersection(sel_formats):
-            continue
-
-        if sel_publishers and h.get("publisher", "–") not in sel_publishers:
-            continue
-
-        dataset_groups = {get_en_group(g) for g in h.get("groups", [])}
-        if sel_categories and not dataset_groups.intersection(sel_categories):
-            continue
-
+        if yr is None or not (issued_year[0] <= yr <= issued_year[1]): continue
+        fmt_set = {f.lower() for f in (h.get("structured_formats") or h.get("resource_formats", []))}
+        if sel_formats and not fmt_set.intersection(sel_formats): continue
+        if sel_publishers and h.get("publisher", "–") not in sel_publishers: continue
+        grp_set = {get_en_group(g) for g in h.get("groups", [])}
+        if sel_categories and not grp_set.intersection(sel_categories): continue
         results.append(h)
 
     st.write(f"### {len(results)} dataset(s) found")
-
     if not results:
-        st.info("No datasets match the current filters. Try relaxing them.")
+        st.info("No datasets match. Try relaxing filters or blend weights.")
 
-    # ——— display cards ———
+    # 7) Display result cards
     for h in results:
-        title       = h.get("title", "(no title)")
-        full_desc   = h.get("description", "")
-        score       = h.get("score", 0.0)
-        ds_id       = h.get("id")
-        url         = f"https://opendata.swiss/en/dataset/{ds_id}"
-        num_res     = h.get("num_resources", 0)
-        issued      = h.get("issued_year", "–")
-        publisher   = h.get("publisher", "–")
-        groups_en   = [get_en_group(g) for g in h.get("groups", [])]
-        dataset_fmts= h.get("structured_formats") or h.get("resource_formats", [])
+        title     = h.get("title", "(no title)")
+        desc      = h.get("description", "")
+        score     = h.get("score", 0.0)
+        url       = f"https://opendata.swiss/en/dataset/{h['id']}"
+        num_res   = h.get("num_resources", 0)
+        issued    = h.get("issued_year", "–")
+        publisher = h.get("publisher", "–")
+        groups_en = h.get("groups", [])
+        fmts      = h.get("structured_formats") or h.get("resource_formats", [])
 
-        # — card header
-        header_cols = st.columns([8, 2])
-        header_cols[0].subheader(title)
-        header_cols[1].markdown(f"**{score:.3f}** [🔗]({url})", unsafe_allow_html=True)
+        c1, c2 = st.columns([8, 2])
+        c1.subheader(title)
+        c2.markdown(f"**{score:.3f}** [🔗]({url})")
 
-        # — description with inline expander
-        if len(full_desc) > MAX_DESC_LEN:
-            short = full_desc[:MAX_DESC_LEN].rstrip() + " …"
-            st.write(short)
+        if len(desc) > MAX_DESC_LEN:
+            st.write(desc[:MAX_DESC_LEN].rstrip() + " …")
             with st.expander("Read more"):
-                st.write(full_desc)
+                st.write(desc)
         else:
-            st.write(full_desc)
+            st.write(desc)
 
-        # — compact metadata line: only include non-empty fields
-        meta_fragments = []
-        if num_res:
-            meta_fragments.append(f"**Resources:** {num_res}")
-        if issued != "–":
-            meta_fragments.append(f"**Issued:** {issued}")
-        if dataset_fmts:
-            meta_fragments.append(f"**Formats:** {', '.join(dataset_fmts)}")
-        if publisher != "–":
-            meta_fragments.append(f"**Publisher:** {publisher}")
-        if groups_en:
-            meta_fragments.append(f"**Category:** {', '.join(groups_en)}")
+        meta_frags = []
+        if num_res:   meta_frags.append(f"**Resources:** {num_res}")
+        if issued!="–":meta_frags.append(f"**Issued:** {issued}")
+        if fmts:      meta_frags.append(f"**Formats:** {', '.join(fmts)}")
+        if publisher: meta_frags.append(f"**Publisher:** {publisher}")
+        if groups_en: meta_frags.append(f"**Category:** {', '.join(groups_en)}")
 
-        st.markdown(" • ".join(meta_fragments))
+        st.markdown(" • ".join(meta_frags))
         st.markdown("---")
 else:
     st.write("Enter a search prompt to begin.")
